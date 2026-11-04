@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="768" height="668" viewBox="0 0 768 668" role="img" aria-labelledby="title desc">
+<title id="title">附件右键菜单 · 单选与多选</title>
+<desc id="desc">单选菜单高亮打开方式，右侧列出应用示例。两项多选菜单与单选使用相同的六条命令。</desc>
+<style>text{font:14px 'Segoe UI','Microsoft YaHei',sans-serif;fill:var(--text)}.small{font-size:12px;fill:var(--muted)}.label{font-size:13px;fill:var(--text)}.panel{fill:var(--panel);stroke:var(--border)}.dark{--bg:#151618;--panel:#202020;--text:#f2f2f2;--muted:#b5b5b5;--border:#383838;--hover:#363636;--rule:#494949}.light{--bg:#f4f5f7;--panel:#fff;--text:#202124;--muted:#595d64;--border:#d1d4d8;--hover:#e8ebef;--rule:#d6d9dd}</style>
+<defs><g id="folder"><path fill="#e6a12c" d="M0 2h7l2 3h11v12H0z"/><path fill="#ffcd52" d="M0 7h20v11H0z"/></g><g id="menus">
+<rect width="768" height="328" rx="10" fill="var(--bg)"/>
+<text class="label" x="24" y="32">单选 · 报告.pdf</text><text class="label" x="510" y="32">多选 · 2 个文件</text>
+<rect class="panel" x="24" y="50" width="236" height="246" rx="8"/>
+<rect x="25" y="129" width="234" height="36" fill="var(--hover)"/>
+<use href="#folder" x="37" y="102"/>
+<text x="66" y="80">打开文件</text><text x="66" y="116">在资源管理器中定位</text><text x="66" y="152">打开方式</text>
+<path d="m239 142 5 5-5 5" fill="none" stroke="var(--muted)" stroke-width="2"/>
+<path d="M34 176H250" stroke="var(--rule)"/>
+<text x="66" y="207">另存为…</text><text x="66" y="243">复制文件</text><text class="small" x="205" y="243">Ctrl+C</text><text x="66" y="279">复制文件路径</text>
+<rect class="panel" x="260" y="129" width="213" height="85" rx="8"/>
+<circle cx="283" cy="153" r="9" fill="#28a4ac"/><text x="303" y="158">Microsoft Edge</text><text class="small" x="432" y="158">默认</text>
+<rect x="275" y="181" width="16" height="16" rx="3" fill="#bf4747"/><text x="303" y="194">Adobe Acrobat</text>
+<rect class="panel" x="510" y="50" width="234" height="246" rx="8"/>
+<use href="#folder" x="523" y="102"/>
+<text x="552" y="80">打开文件</text><text x="552" y="116">在资源管理器中定位</text><text x="552" y="152">打开方式</text>
+<path d="m724 142 5 5-5 5" fill="none" stroke="var(--muted)" stroke-width="2"/>
+<path d="M520 176H734" stroke="var(--rule)"/>
+<text x="552" y="207">另存为…</text><text x="552" y="243">复制 2 个文件</text><text class="small" x="690" y="243">Ctrl+C</text><text x="552" y="279">复制 2 个文件的路径</text>
+</g></defs>
+<g class="dark"><use href="#menus"/><text class="label" x="24" y="317">深色主题</text></g>
+<g transform="translate(0 340)" class="light"><use href="#menus"/><text class="label" x="24" y="317">浅色主题</text></g>
+</svg>
