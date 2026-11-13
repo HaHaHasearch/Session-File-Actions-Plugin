@@ -1,0 +1,63 @@
+name: Verify plugins
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+      - uses: pnpm/action-setup@v6
+        with:
+          dest: .local/tools/pnpm
+      - run: pnpm setup
+      - run: pnpm verify
+      - name: Pack and check plugin contents
+        run: |
+          $destination = (New-Item -ItemType Directory -Path .local/tmp/ci-pack).FullName
+          foreach ($plugin in @('harness', 'opencode')) {
+            pnpm --dir "plugins/$plugin" pack --pack-destination $destination
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $required = @{
+            'dsh-session-file-actions' = @('package/lib/index.js', 'package/lib/client.js', 'package/lib/harness-host.patch', 'package/cordis.patch.yml')
+            'opencode-session-file-actions' = @('package/dist/gui-experimental.cjs')
+          }
+          $packages = foreach ($name in $required.Keys) {
+            $archives = @(Get-ChildItem -LiteralPath $destination -File -Filter "$name-*.tgz")
+            if ($archives.Count -ne 1) { throw "Expected one package for $name" }
+            $entries = @(tar -tf $archives[0].FullName)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            foreach ($entry in $required[$name]) {
+              if ($entry -notin $entries) { throw "Missing $entry in $name" }
+            }
+            if ($entries -match '(^|/)(node_modules|upstream|\.local)(/|$)') {
+              throw "Development files included in $name"
+            }
+            @{
+              file = $archives[0].Name
+              sha256 = (Get-FileHash -LiteralPath $archives[0].FullName -Algorithm SHA256).Hash
+            }
+          }
+          $commit = git rev-parse --verify HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @{ commit = $commit; packages = $packages } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $destination 'manifest.json') -Encoding utf8
+      - name: Upload verified plugin packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-plugin-packages
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            .local/tmp/ci-pack/dsh-session-file-actions-*.tgz
+            .local/tmp/ci-pack/opencode-session-file-actions-*.tgz
+            .local/tmp/ci-pack/manifest.json

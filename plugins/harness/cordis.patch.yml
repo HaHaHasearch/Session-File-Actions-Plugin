@@ -1,0 +1,3 @@
+- insert:
+    - id: session-file-actions
+      name: dsh-session-file-actions

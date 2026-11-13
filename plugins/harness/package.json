@@ -1,0 +1,55 @@
+{
+  "name": "dsh-session-file-actions",
+  "version": "0.0.4",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "dsh": "0.2.2-alpha.3"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-context-menu"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/harness-host.patch",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "tsdown --config tsdown.config.ts",
+    "prepack": "node scripts/stage-host-patch.mjs",
+    "test": "vitest run --config vitest.config.mts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.6-alpha.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.6-alpha.2",
+    "@deepseek-ai/dsh-client-connection": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-client-ui-chat": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-client-ui-context-menu": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-session": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-session-query": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-tool-present": "0.2.2-alpha.3",
+    "@session-file-actions/core": "workspace:*",
+    "@types/node": "22.20.1",
+    "tsdown": "0.22.2",
+    "@deepseek-ai/dsh-api-workspace-files": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-sandbox-policy": "0.2.2-alpha.3"
+  }
+}

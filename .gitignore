@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+/.local/
+/.codegraph/
+upstream/deepseek-harness/
+upstream/opencode/
+/.pnpm-store/
+plugins/opencode/dist/
+plugins/opencode/*.tgz

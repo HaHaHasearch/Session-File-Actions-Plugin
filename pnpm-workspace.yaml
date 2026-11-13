@@ -1,0 +1,15 @@
+packages:
+  - 'packages/*'
+  - 'plugins/*'
+allowBuilds:
+  esbuild: true
+overrides:
+  '@opencode/plugin': 'file:host-patches/opencode/sdk/opencode-plugin-2.2.5-cfe15c68.tgz'
+  '@opencode/client': 'file:host-patches/opencode/sdk/opencode-client-2.2.5-cfe15c68.tgz'
+  '@opencode/schema': 'file:host-patches/opencode/sdk/opencode-schema-2.2.5-cfe15c68.tgz'
+  '@opencode/protocol': 'file:host-patches/opencode/sdk/opencode-protocol-2.2.5-cfe15c68.tgz'
+  '@opencode/util': 'file:host-patches/opencode/sdk/opencode-util-2.2.5-cfe15c68.tgz'
+  '@opencode/ai': 'file:host-patches/opencode/sdk/opencode-ai-2.2.5-cfe15c68.tgz'
+# pnpm 11 defaults verifyDepsBeforeRun to "install"; that implicit install would
+# use the machine default store instead of the store chosen by scripts/install.ps1.
+verifyDepsBeforeRun: false

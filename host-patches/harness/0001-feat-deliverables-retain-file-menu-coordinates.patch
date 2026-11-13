@@ -1,0 +1,687 @@
+diff --git a/apps/desktop/README.md b/apps/desktop/README.md
+index 335991f722..09e977acb6 100644
+--- a/apps/desktop/README.md
++++ b/apps/desktop/README.md
+@@ -401,3 +401,15 @@ The account provider’s `embeddedPageDist` configuration adds a `dist` query pa
+ ## Dev Note
+ 
+ Pre-launch CDN and capacity decisions are tracked in the [Desktop update proposal](../../.agents/notes/proposed/feature/2026-09-08-desktop-update-policy-and-installation.md#cdn-and-capacity-qualification).
++
++
++## Authorized delivery snapshots (validation patch)
++
++The `dshDesktop.sessionFileActions` main-frame bridge serves the matching Session File Actions plugin. `begin(operationId)` accepts a new copy and immediately revokes any earlier preparation, even if the new Host authorization later fails. `copy` consumes that reservation once and redeems a short-lived, one-use Host grant through the private fixed endpoint; renderer paths, URLs and bytes are never accepted as file authority. The Host re-resolves the session delivery and checks file permissions at execution.
++
++`cancel` affects preparation only. Publication cannot be cancelled once submitted. The shared snapshot module validates its bytes and file name before publishing `ClipboardItem` `text/uri-list`. Pending files are removed on failure/cancellation; published or uncertain references survive unload and application exit. No automatic reclamation is implemented in this validation patch. Full-file reads currently use the Host's 32 MiB bound and report `too_large`; larger-file support remains a release validation item.
++
++Safe diagnostics contain operation ID, stage, classified reason and known errno, never raw paths or file bodies. `copied` requires the clipboard write promise to succeed; an uncertain publication returns `unconfirmed`. Rebuild using the repository `build:artifacts` then `build:check`; regressions live in `tests/session-file-actions.spec.ts`.
++
++
++`begin` returns a boolean receipt: `true` is the sole acceptance/supersession boundary; `false` means a previous copy is still publishing and preserves that operation. The client cancels older authorization only after acceptance, and always processes main-owned copied/unconfirmed receipts independently from authorization cancellation.
+diff --git a/apps/desktop/src/ipc.ts b/apps/desktop/src/ipc.ts
+index 83ebe7415a..7c6a18aa0c 100644
+--- a/apps/desktop/src/ipc.ts
++++ b/apps/desktop/src/ipc.ts
+@@ -1,3 +1,15 @@
++export interface CopyDeliveryRequest { token: string; hostInstanceId: string; sessionId: string; operationId: string }
++export interface CopyDeliveryResult { status: 'copied' | 'failed' | 'cancelled' | 'unconfirmed'; reason?: string }
++/** Main-frame-only delivery copy. Requests carry Host grants, never renderer-owned paths. */
++export interface SessionFileActions {
++  /** Return true only when a new operation is accepted and earlier preparation revoked; false means publication is busy and preserves the earlier result. */
++  begin(operationId: string): Promise<boolean>
++  /** Consume the matching begin reservation and one-use Host grant; resolve only after system publication. */
++  copy(request: CopyDeliveryRequest): Promise<CopyDeliveryResult>
++  /** Abort preparation; publication already submitted to the system cannot be cancelled or replayed. */
++  cancel(operationId: string): Promise<void>
++}
++
+ import type { DesktopFileActions } from '@deepseek-ai/dsh-client-ui-file-actions/types'
+ /** Typed preload operations exposed only by the Electron shell. */
+ 
+@@ -91,6 +103,7 @@ export interface DesktopUpdatePresentation {
+ 
+ /** Product documents cannot supply update versions, package URLs, or installation authorization. */
+ export interface DshDesktopProductApi {
++  readonly sessionFileActions: SessionFileActions
+   readonly fileActions: DesktopFileActions
+   readonly protocolVersion: 1
+   readonly browser: DesktopBrowserBridge
+diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
+index 1a2488fe9d..11b19f1a8c 100644
+--- a/apps/desktop/src/main.ts
++++ b/apps/desktop/src/main.ts
+@@ -1,3 +1,4 @@
++import { installSessionFileActions } from "./session-file-actions.ts"
+ /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
+ 
+ import { installFileActions } from './file-actions.ts'
+@@ -853,6 +854,12 @@ async function main(): Promise<void> {
+     return owner
+   }
+   installFileActions(assertMainApplication, () => hostUrl)
++  installSessionFileActions(assertMainApplication, (request, signal) => {
++    if (hostUrl === undefined || hostCookie === undefined) throw new Error('Desktop Host unavailable')
++    return forwardWebRequest(new Request('dsh-app://app/api/session-file-actions.copy', {
++      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request), signal,
++    }), hostUrl, hostCookie)
++  })
+   ipcMain.on(PLATFORM_IPC.bootstrap, (event) => {
+     try { event.returnValue = platformView.bootstrap(event) }
+     catch { event.returnValue = null }
+diff --git a/apps/desktop/src/preload-app.ts b/apps/desktop/src/preload-app.ts
+index 6b4e989614..e67f027431 100644
+--- a/apps/desktop/src/preload-app.ts
++++ b/apps/desktop/src/preload-app.ts
+@@ -16,6 +16,11 @@ import type { FileDragHandle } from '@deepseek-ai/dsh-util-file-drag'
+ function createProductApi(): DshDesktopProductApi {
+   return {
+     protocolVersion: 1,
++    sessionFileActions: {
++      begin: operationId => ipcRenderer.invoke('dsh-desktop:delivery-begin', operationId),
++      copy: request => ipcRenderer.invoke('dsh-desktop:delivery-copy', request),
++      cancel: operationId => ipcRenderer.invoke('dsh-desktop:delivery-cancel', operationId),
++    },
+     fileActions: {
+       save: request => ipcRenderer.invoke(DESKTOP_IPC.fileSave, request) as Promise<FileSaveResult>,
+       readClipboardImage: url => ipcRenderer.invoke(DESKTOP_IPC.clipboardImageRead, url) as
+diff --git a/apps/desktop/src/session-file-actions-files.ts b/apps/desktop/src/session-file-actions-files.ts
+new file mode 100644
+index 0000000000..835a8e5d3c
+--- /dev/null
++++ b/apps/desktop/src/session-file-actions-files.ts
+@@ -0,0 +1,28 @@
++import { createHash } from "node:crypto";
++import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
++import { join } from "node:path";
++import { pathToFileURL } from "node:url";
++
++export async function copySnapshot(
++  root: string, name: string, bytes: Uint8Array, expectedHash: string, signal: AbortSignal,
++  publish: (uriList: string) => Promise<void>,
++): Promise<void> {
++  if (!name || name === "." || name === ".." || /[<>:"/\\|?*\x00-\x1f]/u.test(name)
++    || /[. ]$/u.test(name) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(name)) throw new Error("invalid_filename");
++  if (!/^[a-f0-9]{64}$/u.test(expectedHash) || createHash("sha256").update(bytes).digest("hex") !== expectedHash) throw new Error("integrity_failed");
++  signal.throwIfAborted();
++  await mkdir(root, { recursive: true });
++  const directory = await mkdtemp(join(root, "copy-"));
++  let publishing = false;
++  try {
++    const path = join(directory, name);
++    await writeFile(path, bytes, { flag: "wx", signal });
++    if (createHash("sha256").update(await readFile(path, { signal })).digest("hex") !== expectedHash) throw new Error("integrity_failed");
++    signal.throwIfAborted();
++    // A published or uncertain clipboard reference must survive plugin and application exit.
++    publishing = true;
++    await publish(`${pathToFileURL(path).href}\r\n`);
++  } finally {
++    if (!publishing) await rm(directory, { recursive: true });
++  }
++}
+diff --git a/apps/desktop/src/session-file-actions.ts b/apps/desktop/src/session-file-actions.ts
+new file mode 100644
+index 0000000000..fbc4372289
+--- /dev/null
++++ b/apps/desktop/src/session-file-actions.ts
+@@ -0,0 +1,101 @@
++import { app, ipcMain, clipboard, ClipboardItem, type BrowserWindow, type IpcMainInvokeEvent } from 'electron'
++import { join } from 'node:path'
++import { copySnapshot } from './session-file-actions-files.ts'
++
++import type { CopyDeliveryRequest, CopyDeliveryResult } from './ipc.ts'
++
++/**
++ * Register delivery-copy IPC for the trusted application main frame.
++ * begin supersedes all earlier preparation before Host authorization starts; copy consumes its reservation once.
++ * Cancellation is effective until system publication starts. Published/uncertain snapshots survive application exit.
++ * @param owner - validates the owned main frame on every call and immediately before publication.
++ * @param consume - redeems the one-use Host grant through a fixed private endpoint.
++ */
++export function installSessionFileActions(owner: (event: IpcMainInvokeEvent) => BrowserWindow,
++  consume: (request: CopyDeliveryRequest, signal: AbortSignal) => Promise<Response>): void {
++  let active: { id: string; abort: AbortController; publishing: boolean; started: boolean } | undefined
++  ipcMain.handle('dsh-desktop:delivery-begin', (event, id: unknown) => {
++    owner(event)
++    if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/u.test(id)) throw new Error('invalid_operation')
++    if (active?.publishing) return false
++    active?.abort.abort()
++    active = { id, abort: new AbortController(), publishing: false, started: false }
++    return true
++  })
++  ipcMain.handle('dsh-desktop:delivery-cancel' , (event, id: unknown) => {
++    owner(event)
++    if (active && active.id === id && !active.publishing) active.abort.abort()
++  })
++  ipcMain.handle('dsh-desktop:delivery-copy', async (event, value: unknown): Promise<CopyDeliveryResult> => {
++    const window = owner(event)
++    if (typeof value !== 'object' || value === null
++      || !('token' in value) || typeof value.token !== 'string' || !/^[0-9a-f-]{36}$/u.test(value.token)
++      || !('operationId' in value) || typeof value.operationId !== 'string' || !/^[0-9a-f-]{36}$/u.test(value.operationId)
++      || !('sessionId' in value) || typeof value.sessionId !== 'string' || value.sessionId.length < 1 || value.sessionId.length > 256
++      || !('hostInstanceId' in value) || typeof value.hostInstanceId !== 'string' || !/^[a-f0-9]{64}$/u.test(value.hostInstanceId)) throw new Error('invalid_copy_request')
++    const request = { token: value.token, operationId: value.operationId, sessionId: value.sessionId, hostInstanceId: value.hostInstanceId }
++    const operation = active
++    if (!operation || operation.id !== request.operationId || operation.started || operation.abort.signal.aborted) return { status: 'cancelled', reason: 'superseded' }
++    operation.started = true
++    const signal = AbortSignal.any([operation.abort.signal, AbortSignal.timeout(60_000)])
++    const cancel = (): void => operation.abort.abort()
++    const navigate = (_event: Electron.Event, _url: string, inPlace: boolean, mainFrame: boolean): void => {
++      if (mainFrame && !inPlace) cancel()
++    }
++    window.once('closed', cancel)
++    window.webContents.on('did-start-navigation', navigate)
++    let stage = 'authorize'
++    try {
++      const response = await consume(request, signal)
++      if (!response.ok) {
++        const reason = await response.text()
++        throw new Error(['permission_denied', 'not_found', 'too_large', 'io_error', 'invalid_grant', 'not_regular_file'].includes(reason) ? reason : `host_${response.status}`)
++      }
++      if (response.headers.get('x-copy-host') !== request.hostInstanceId || response.headers.get('x-copy-operation') !== request.operationId) throw new Error('identity_mismatch')
++      const size = Number(response.headers.get('x-copy-size'))
++      const hash = response.headers.get('x-copy-sha256')
++      const encodedName = response.headers.get('x-copy-name')
++      if (size > 32 * 1024 * 1024) throw new Error('too_large')
++      if (!Number.isSafeInteger(size) || size < 0 || !hash || !encodedName || !response.body) throw new Error('invalid_content')
++      stage = 'prepare'
++      const reader = response.body.getReader()
++      const chunks: Uint8Array[] = []
++      let received = 0
++      try {
++        for (;;) {
++          const chunk = await reader.read()
++          if (chunk.done) break
++          received += chunk.value.length
++          if (received > size) throw new Error('size_mismatch')
++          chunks.push(chunk.value)
++        }
++      } finally { await reader.cancel(); reader.releaseLock() }
++      if (received !== size) throw new Error('size_mismatch')
++      await copySnapshot(join(app.getPath('userData'), 'session-file-actions'), decodeURIComponent(encodedName), Buffer.concat(chunks), hash, signal, async uriList => {
++        owner(event)
++        signal.throwIfAborted()
++        if (active !== operation) throw new Error('superseded')
++        operation.publishing = true
++        stage = 'publish'
++        await clipboard.write([new ClipboardItem({ 'text/uri-list': uriList })])
++      })
++      console.info(JSON.stringify({ operationId: request.operationId, host: 'harness', stage: 'published', status: 'copied' }))
++      return { status: 'copied' }
++    } catch (error: unknown) {
++      const status = operation.publishing ? 'unconfirmed' : signal.aborted ? 'cancelled' : 'failed'
++      const code = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined
++      const errno = typeof code === 'string' && ['ENOSPC', 'EDQUOT', 'EACCES', 'EPERM', 'EIO', 'ENOENT', 'ENOTDIR'].includes(code) ? code : undefined
++      const reason = errno === 'ENOSPC' || errno === 'EDQUOT' ? 'disk_full'
++        : errno === 'EACCES' || errno === 'EPERM' ? 'permission_denied'
++        : errno === 'EIO' ? 'io_error' : errno === 'ENOENT' || errno === 'ENOTDIR' ? 'not_found'
++        : error instanceof Error && /^(host_\d+|identity_mismatch|invalid_content|size_mismatch|invalid_filename|integrity_failed|superseded|permission_denied|not_found|too_large|io_error|invalid_grant|not_regular_file)$/u.test(error.message) ? error.message
++        : stage === 'publish' ? 'publish_failed' : 'copy_failed'
++      console.error(JSON.stringify({ operationId: request.operationId, host: 'harness', stage, status, reason, errno }))
++      return { status, reason }
++    } finally {
++      window.removeListener('closed', cancel)
++      window.webContents.removeListener('did-start-navigation', navigate)
++      if (active === operation) active = undefined
++    }
++  })
++}
+diff --git a/apps/desktop/tests/session-file-actions.spec.ts b/apps/desktop/tests/session-file-actions.spec.ts
+new file mode 100644
+index 0000000000..2642482146
+--- /dev/null
++++ b/apps/desktop/tests/session-file-actions.spec.ts
+@@ -0,0 +1,112 @@
++import { EventEmitter } from 'node:events'
++import { createHash, randomUUID } from 'node:crypto'
++import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
++import { resolve, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { BrowserWindow } from 'electron'
++import { afterEach, expect, it, vi } from 'vitest'
++import { installSessionFileActions } from '../src/session-file-actions.ts'
++const mocks = vi.hoisted(() => ({ handlers: new Map<string, Function>(), write: vi.fn(), getPath: vi.fn(), mkdirFailure: (() : unknown => undefined)() }))
++vi.mock('node:fs/promises', async importOriginal => {
++  const original = await importOriginal<typeof import('node:fs/promises')>()
++  return { ...original, mkdir: (...args: Parameters<typeof original.mkdir>) => {
++    if (mocks.mkdirFailure) throw mocks.mkdirFailure
++    return original.mkdir(...args)
++  } }
++})
++vi.mock('electron', () => ({
++  BrowserWindow: class extends EventEmitter { webContents = new EventEmitter() },
++  app: { getPath: mocks.getPath }, ipcMain: { handle: (name: string, fn: Function) => mocks.handlers.set(name, fn) },
++  clipboard: { write: mocks.write }, ClipboardItem: class { constructor(readonly data: unknown) {} },
++}))
++const roots: string[] = []
++afterEach(async () => { vi.clearAllMocks(); mocks.mkdirFailure = undefined; mocks.handlers.clear(); for (const root of roots.splice(0)) await rm(root, { recursive: true }); })
++async function fixture() {
++  const base = resolve('.local/tmp/copy-tests'); await mkdir(base, { recursive: true });
++  const root = await mkdtemp(join(base, 'test-')); roots.push(root); mocks.getPath.mockReturnValue(root);
++  const owner = vi.fn(() => new BrowserWindow());
++  const request = { token: randomUUID(), operationId: randomUUID(), sessionId: 'session', hostInstanceId: 'a'.repeat(64) };
++  const data = new Uint8Array([0, 255, 17]);
++  const consume = vi.fn(async () => new Response(data, { headers: {
++    'x-copy-host': request.hostInstanceId, 'x-copy-operation': request.operationId, 'x-copy-name': 'binary.bin',
++    'x-copy-size': '3', 'x-copy-sha256': createHash('sha256').update(data).digest('hex'),
++  } }));
++  installSessionFileActions(owner, consume);
++  const begin = (id = request.operationId): Promise<unknown> => {
++    const handler = mocks.handlers.get('dsh-desktop:delivery-begin'); if (!handler) throw new Error('missing begin');
++    return Promise.resolve(Reflect.apply(handler, undefined, [{}, id]));
++  };
++  const invoke = async (value: unknown = request, accept = true): Promise<unknown> => {
++    if (accept) await begin();
++    const handler = mocks.handlers.get('dsh-desktop:delivery-copy'); if (!handler) throw new Error('missing handler');
++    return Reflect.apply(handler, undefined, [{}, value]);
++  };
++  return { invoke, begin, owner, consume, request };
++}
++it('publishes only the checked snapshot and waits for the system reply', async () => {
++  const { invoke } = await fixture();
++  const complete = Promise.withResolvers<void>(); mocks.write.mockReturnValue(complete.promise);
++  const operation = invoke(); let done = false; void operation.then(() => { done = true });
++  await vi.waitFor(() => expect(mocks.write).toHaveBeenCalledOnce()); expect(done).toBe(false);
++  const item: unknown = mocks.write.mock.calls[0]?.[0]?.[0];
++  if (typeof item !== 'object' || item === null || !('data' in item) || typeof item.data !== 'object' || item.data === null || !('text/uri-list' in item.data) || typeof item.data['text/uri-list'] !== 'string') throw new Error('missing uri list');
++  expect([...await readFile(fileURLToPath(item.data['text/uri-list'].trim()))]).toEqual([0, 255, 17]);
++  complete.resolve(); expect(await operation).toEqual({ status: 'copied' });
++});
++it('rejects an untrusted sender and arbitrary renderer path without consuming credentials', async () => {
++  const { invoke, owner, consume } = await fixture();
++  owner.mockImplementationOnce(() => { throw new Error('untrusted') });
++  await expect(invoke()).rejects.toThrow('untrusted');
++  await expect(invoke({ path: 'private' })).rejects.toThrow('invalid_copy_request');
++  expect(consume).not.toHaveBeenCalled(); expect(mocks.write).not.toHaveBeenCalled();
++});
++it('keeps the clipboard on failed Host authorization or incorrect identity', async () => {
++  const { invoke, consume } = await fixture();
++  consume.mockResolvedValueOnce(new Response('denied', { status: 403 }));
++  expect(await invoke()).toEqual({ status: 'failed', reason: 'host_403' });
++  consume.mockResolvedValueOnce(new Response('bytes'));
++  expect(await invoke()).toEqual({ status: 'failed', reason: 'identity_mismatch' });
++  expect(mocks.write).not.toHaveBeenCalled();
++});
++it('reports an uncertain system publication without claiming success', async () => {
++  const { invoke } = await fixture(); mocks.write.mockRejectedValueOnce(new Error('system unknown'));
++  expect(await invoke()).toEqual({ status: 'unconfirmed', reason: 'publish_failed' });
++});
++
++it.each([['ENOSPC', 'disk_full'], ['EACCES', 'permission_denied'], ['EIO', 'io_error']])('preserves safe %s diagnostics and never publishes', async (code, reason) => {
++  const { invoke } = await fixture();
++  mocks.mkdirFailure = Object.assign(new Error('private/path'), { code });
++  const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
++  try {
++    expect(await invoke()).toEqual({ status: 'failed', reason });
++    expect(mocks.write).not.toHaveBeenCalled();
++    expect(JSON.stringify(logged.mock.calls)).toContain(code);
++    expect(JSON.stringify(logged.mock.calls)).not.toContain('private/path');
++  } finally { logged.mockRestore(); }
++});
++it('revokes A as soon as B begins, without requiring a B grant', async () => {
++  const { invoke, begin, consume } = await fixture();
++  const response = Promise.withResolvers<Response>(); consume.mockReturnValueOnce(response.promise);
++  const a = invoke(); await vi.waitFor(() => expect(consume).toHaveBeenCalledOnce());
++  await begin(randomUUID()); response.resolve(new Response('denied', { status: 403 }));
++  expect(await a).toMatchObject({ status: 'cancelled' }); expect(mocks.write).not.toHaveBeenCalled();
++});
++it('rejects a delayed A grant after B begins before reading the Host', async () => {
++  const { invoke, begin, consume } = await fixture();
++  await begin(); await begin(randomUUID());
++  expect(await invoke(undefined, false)).toEqual({ status: 'cancelled', reason: 'superseded' });
++  expect(consume).not.toHaveBeenCalled(); expect(mocks.write).not.toHaveBeenCalled();
++});
++it('reports Host too_large distinctly without clipboard publication', async () => {
++  const { invoke, consume } = await fixture(); consume.mockResolvedValueOnce(new Response('too_large', { status: 413 }));
++  expect(await invoke()).toEqual({ status: 'failed', reason: 'too_large' }); expect(mocks.write).not.toHaveBeenCalled();
++});
++
++it.each(['copied', 'unconfirmed'])('rejects B as busy while preserving A %s publication receipt', async status => {
++  const { invoke, begin } = await fixture(); const receipt = Promise.withResolvers<void>();
++  mocks.write.mockReturnValueOnce(receipt.promise);
++  const a = invoke(); await vi.waitFor(() => expect(mocks.write).toHaveBeenCalledOnce());
++  expect(await begin(randomUUID())).toBe(false);
++  if (status === 'copied') receipt.resolve(); else receipt.reject(new Error('system unknown'));
++  expect(await a).toMatchObject({ status }); expect(mocks.write).toHaveBeenCalledOnce();
++});
+diff --git a/packages/client/ui-context-menu/src/client/index.ts b/packages/client/ui-context-menu/src/client/index.ts
+index ac4fc288be..6de98f6195 100644
+--- a/packages/client/ui-context-menu/src/client/index.ts
++++ b/packages/client/ui-context-menu/src/client/index.ts
+@@ -14,7 +14,7 @@ import { MenuOverlay } from './View.tsx'
+ import type { ContextMenus, MenuResolution, ContextMenuTarget, ContextMenuIcon, MenuPoint, UseContextMenu } from './types.ts'
+ import { createContextMenuBindings } from './trigger.ts'
+ 
+-export type { ContextMenus, ContextMenuTarget, ContextMenuTargetMap, MenuPoint, MenuAction, MenuActionView, MenuContribution, MenuResolution } from './types.ts'
++export type { ContextMenus, ContextMenuTarget, ContextMenuTargetMap, ContextMenuFileTarget, MenuPoint, MenuAction, MenuActionView, MenuContribution, MenuResolution } from './types.ts'
+ export type { ContextMenuBindings, ContextMenuTriggerProps, UseContextMenu } from './types.ts'
+ export type { ContextMenuIcon } from './types.ts'
+ export { createMenuStore } from './store.ts'
+diff --git a/packages/client/ui-context-menu/src/client/types.ts b/packages/client/ui-context-menu/src/client/types.ts
+index d32a788fb4..eae1ad1a78 100644
+--- a/packages/client/ui-context-menu/src/client/types.ts
++++ b/packages/client/ui-context-menu/src/client/types.ts
+@@ -24,10 +24,18 @@ export interface ContextMenuBindings {
+ /** Read menu gesture bindings owned by the current menu plugin lifetime. */
+ export type UseContextMenu = () => ContextMenuBindings
+ 
++/** A Session file target; feature plugins may extend it with an occurrence. */
++export interface ContextMenuFileTarget {
++  readonly sessionId: SessionId
++  readonly path: string
++  readonly line?: number
++  readonly paneId?: PaneId
++}
++
+ /** External plugins extend this map with their own target families. */
+ export interface ContextMenuTargetMap {
+   session: { readonly sessionId: SessionId; readonly displayTitle: string }
+-  file: { readonly sessionId: SessionId; readonly path: string; readonly line?: number; readonly paneId?: PaneId }
++  file: ContextMenuFileTarget
+   directory: { readonly sessionId: SessionId; readonly path: string }
+   url: { readonly sessionId: SessionId; readonly url: string }
+   image: {
+diff --git a/packages/client/ui-deliverables/README.i18n.yaml b/packages/client/ui-deliverables/README.i18n.yaml
+index 675bcff105..b8317d754b 100644
+--- a/packages/client/ui-deliverables/README.i18n.yaml
++++ b/packages/client/ui-deliverables/README.i18n.yaml
+@@ -15,11 +15,11 @@
+   en: d152484eb41ac6b4
+   zh: 09388d293f9be9cb
+ /deepseek-ai-dsh-client-ui-deliverables/use-this-package:
+-  en: 4a2fcdcf13276fef
+-  zh: 8bde03bbbf15840c
++  en: f6542b0d6f2942d9
++  zh: 70428b589c1c0210
+ /deepseek-ai-dsh-client-ui-deliverables/use-this-package/explicit-deliveries:
+-  en: 5fc6e2d7926f08c0
+-  zh: 18cdb7450add873e
++  en: a44f364399bdf4b3
++  zh: f08bf2fd8dd0a785
+ /deepseek-ai-dsh-client-ui-deliverables/use-this-package/the-changed-files-card:
+   en: 4b279e2bddddc083
+   zh: a3135393299c935b
+@@ -33,8 +33,8 @@
+   en: 7ee5ee783902662c
+   zh: fdf2c244fb22b8ab
+ /deepseek-ai-dsh-client-ui-deliverables/further-exploration:
+-  en: 98eda99fafcb04b9
+-  zh: e6a21254c0383f48
++  en: 59785ad4e547ad35
++  zh: a5e2c8ff02ad104a
+ /deepseek-ai-dsh-client-ui-deliverables/model-experience:
+   en: 215e7ba838619b7b
+   zh: a311da3843709f90
+diff --git a/packages/client/ui-deliverables/README.md b/packages/client/ui-deliverables/README.md
+index 0632574d83..571e719099 100644
+--- a/packages/client/ui-deliverables/README.md
++++ b/packages/client/ui-deliverables/README.md
+@@ -25,6 +25,8 @@ This package renders the changed-files card a finished turn ends with — the fi
+ <a id="use-this-package"></a>
+ ## Use this package
+ 
++The active browser plugin provides `deliveryCardCoordinates` version 1 while delivery-card menus carry their original event sequence and file index. Consumers can check this scoped capability and release their own registrations when it disappears.
++
+ Mount this plugin alongside `ui-conversation` and the Host [workspace-changes](../../deliverables/workspace-changes/README.md) plugin; a finished turn then ends with the changed-files card between the closing message's body and its action footer. Without a served summary — a turn that changed no file, the plugin composed out, or a Host restarted since the turn ran — the card is absent and only deliveries and prose links remain; outside a git repository the summary lists file-tool edits only.
+ 
+ Changed-file and delivery entry cards and hover previews follow the [R16 preview-card rule](../../../docs/ui-radius.md#radius-scale); their file-icon tiles use the same rule’s R10 exception. Each retains the same contour on hover.
+@@ -34,7 +36,7 @@ Changed-file and delivery entry cards and hover previews follow the [R16 preview
+ 
+ The `present` tool's preparing stage is one non-expandable document-icon row. It does not show filenames, create delivery cards, or enable file actions before the recorded call supplies arguments.
+ 
+-The Web `standard`, `ptc`, and `cordis` presets expose `present` for final files accessible through the Session filesystem, including files created through Bash. Call it with `files: [{ path, description? }]` after creating the files. The [present tool](../../deliverables/deliverable-file-references/README.md) owns file-count limits and Session declarations. A single delivery fills the row; multiple deliveries form a two-column grid, collapsed after four files. Cards show the basename, description or file type, and a shared native opening control. Delivery and changed-file icon tiles use white at 50% opacity in the light theme and 5% in the dark theme. Icon tiles and single-file changed cards use the same border as delivery cards. Clicking the card previews the file in the right Sidebar. The control opens the default application and lists associated applications, with file reveal last. Matching inline-code references also open Sidebar previews. Delivery cards appear in the turn tail only after the turn ends, so a turn waiting on a blocking question shows none yet; the `present` tool description directs the model to link files in its message for earlier review. Cards include every declaration in the turn, including declarations recorded after the closing reply; duplicate declarations use the last description.
++The Web `standard`, `ptc`, and `cordis` presets expose `present` for final files accessible through the Session filesystem, including files created through Bash. Call it with `files: [{ path, description? }]` after creating the files. The [present tool](../../deliverables/deliverable-file-references/README.md) owns file-count limits and Session declarations. A single delivery fills the row; multiple deliveries form a two-column grid, collapsed after four files. Cards show the basename, description or file type, and a shared native opening control. Delivery and changed-file icon tiles use white at 50% opacity in the light theme and 5% in the dark theme. Icon tiles and single-file changed cards use the same border as delivery cards. Clicking the card previews the file in the right Sidebar. The control opens the default application and lists associated applications, with file reveal last. Matching inline-code references also open Sidebar previews. Delivery cards appear in the turn tail only after the turn ends, so a turn waiting on a blocking question shows none yet; the `present` tool description directs the model to link files in its message for earlier review. Cards retain every occurrence in recorded event and file order, including repeated paths and declarations recorded after the closing reply.
+ 
+ The `present` tool row retains its document icon and recorded result across progress, success, failure, and interruption. Native actions share pending state and publish progress or retryable errors on the card. An acknowledged open or reveal immediately restores the file description; failures remain visible until another attempt. Each gesture settles on a discriminated outcome — acknowledged open, acknowledged reveal, named failure, or a request dropped because the same file was already opening or the plugin was disposed — which the contributed control reports according to the mobile success and shared failure policy in [ui-open-in-app](../ui-open-in-app/README.md). Disposing the plugin cancels pending requests and suppresses their announcements. Desktop metadata is loaded when cards mount and invalidated on connection replacement. Without a Host desktop, cards retain Sidebar preview but omit native controls; failed metadata reads offer Retry. Delivery cards and change review expose `deliverables.file.actions` and `deliverables.review.file.actions`, supplied by [ui-open-in-app](../ui-open-in-app/README.md). Association GET requests and native POST actions both validate the recorded file coordinates and Session filesystem mapping before using the Host desktop.
+ 
+@@ -86,7 +88,7 @@ Read these pages when the deliverables surface is not enough. They move from the
+ 
+ -----
+ 
+-Delivery cards and known inline file mentions expose a [context menu](../ui-context-menu/README.md) for their declared Session file, preserving the original path and optional line.
++Delivery cards and known inline file mentions expose a [context menu](../ui-context-menu/README.md) for their declared Session file, preserving the original path and optional line. Delivery-card targets also carry the viewed Session's delivery-event sequence and original file index; other file targets do not.
+ 
+ <a id="model-experience"></a>
+ ## Model Experience
+diff --git a/packages/client/ui-deliverables/README.zh.md b/packages/client/ui-deliverables/README.zh.md
+index 2951888e72..933db7b5b5 100644
+--- a/packages/client/ui-deliverables/README.zh.md
++++ b/packages/client/ui-deliverables/README.zh.md
+@@ -25,6 +25,8 @@ kind: "package-reference"
+ <a id="use-this-package"></a>
+ ## 使用本包
+ 
++浏览器插件启用时提供 `deliveryCardCoordinates` 版本 1，表示交付卡片菜单携带原始事件序号和文件索引。消费方可以检查这一有生命周期的能力，并在其消失时释放自己的注册。
++
+ 与 `ui-conversation` 和 Host 侧的 [workspace-changes](../../deliverables/workspace-changes/README.zh.md) 插件一起挂载本插件；已完成轮次随即以改动文件卡片收尾，位于收尾消息正文与其动作页脚之间。没有可提供的摘要时——本轮没有改动任何文件、该插件被组合出去，或该轮之后 Host 重启过——卡片不出现，只保留交付卡片与正文链接；工作区不在 git 仓库内时摘要只列文件工具的编辑。
+ 
+ 改动文件与交付文件的入口卡片和悬停预览浮层遵循 [R16 预览卡片规则](../../../docs/ui-radius.zh.md#radius-scale)；内部文件图标底框采用该规则的 R10 特例。各自的 hover 保持相同轮廓。
+@@ -34,7 +36,7 @@ kind: "package-reference"
+ 
+ `present` 工具的准备阶段是带文档图标的不可展开单行。记录的调用提供参数前，该行不显示文件名、不创建交付卡片，也不启用文件操作。
+ 
+-Web 的 `standard`、`ptc` 与 `cordis` preset 提供 `present`，用于声明会话文件系统可访问的最终文件，包括通过 Bash 创建的文件。创建后以 `files: [{ path, description? }]` 调用。[present 工具](../../deliverables/deliverable-file-references/README.zh.md)拥有文件数量限制和会话声明。单个交付占满一行，多个交付使用双列网格，超过四个时默认收起。卡片显示文件名、说明或文件类型，以及共享的原生打开控件。交付和改动文件卡片的图标底块在浅色主题下使用 50% 不透明度的白色，深色主题下为 5%。图标底块与单文件改动卡片的外框使用与交付卡片相同的描边。点击卡片会在右侧 Sidebar 预览文件。控件打开默认应用，并列出关联应用，文件定位始终放在最后。匹配的行内代码引用也打开 Sidebar 预览。交付卡片只在本轮结束后出现在 turn tail 中，因此等待阻塞提问的轮次暂时没有卡片；`present` 工具描述会引导模型在需要提前审阅时于消息中链接文件。卡片包含本轮的所有声明，包括收尾回复之后记录的声明；重复声明使用最近一次的说明。
++Web 的 `standard`、`ptc` 与 `cordis` preset 提供 `present`，用于声明会话文件系统可访问的最终文件，包括通过 Bash 创建的文件。创建后以 `files: [{ path, description? }]` 调用。[present 工具](../../deliverables/deliverable-file-references/README.zh.md)拥有文件数量限制和会话声明。单个交付占满一行，多个交付使用双列网格，超过四个时默认收起。卡片显示文件名、说明或文件类型，以及共享的原生打开控件。交付和改动文件卡片的图标底块在浅色主题下使用 50% 不透明度的白色，深色主题下为 5%。图标底块与单文件改动卡片的外框使用与交付卡片相同的描边。点击卡片会在右侧 Sidebar 预览文件。控件打开默认应用，并列出关联应用，文件定位始终放在最后。匹配的行内代码引用也打开 Sidebar 预览。交付卡片只在本轮结束后出现在 turn tail 中，因此等待阻塞提问的轮次暂时没有卡片；`present` 工具描述会引导模型在需要提前审阅时于消息中链接文件。卡片按事件和文件的记录顺序保留每次交付，包括重复路径及收尾回复之后记录的声明。
+ 
+ `present` 工具行在执行、成功、失败和中断状态下保留文档图标及记录的结果。原生操作共享等待状态，并在卡片显示进度或可重试错误。打开或定位获得确认后立即恢复文件说明；失败信息保留到下次尝试。每次操作会得出一个带判别标签的结果——已确认的打开、已确认的定位、具名失败，或因同一文件正在打开或插件已释放而丢弃的请求——由贡献的控件按照 [ui-open-in-app](../ui-open-in-app/README.zh.md) 的移动端成功与各端失败反馈规则播报。释放插件会取消在途请求，并停止播报这些请求的结果。卡片挂载时读取桌面信息，连接更换时清除缓存。Host 没有桌面时，卡片保留 Sidebar 预览并隐藏原生控件；元数据读取失败时提供重试。交付卡片和变更对比页通过 `deliverables.file.actions` 和 `deliverables.review.file.actions` 使用 [ui-open-in-app](../ui-open-in-app/README.zh.md) 提供的控件。关联应用 GET 查询与原生 POST 操作都会先校验记录中的文件坐标及会话文件系统映射，再调用 Host 桌面。
+ 
+@@ -86,7 +88,7 @@ Node 半部提供经过身份验证的原生文件打开；共用指导由[模
+ 
+ -----
+ 
+-交付卡片和已知行内文件引用为其声明的会话文件提供[右键菜单](../ui-context-menu/README.zh.md)，保留原始路径和可选行号。
++交付卡片和已知行内文件引用为其声明的会话文件提供[右键菜单](../ui-context-menu/README.zh.md)，保留原始路径和可选行号。交付卡片的菜单目标还包含当前查看会话的交付事件序号和原始文件索引；其他文件目标不包含这两个字段。
+ 
+ <a id="model-experience"></a>
+ ## 模型体验
+diff --git a/packages/client/ui-deliverables/src/client/Deliverables.tsx b/packages/client/ui-deliverables/src/client/Deliverables.tsx
+index 89cfa24afa..732b605dde 100644
+--- a/packages/client/ui-deliverables/src/client/Deliverables.tsx
++++ b/packages/client/ui-deliverables/src/client/Deliverables.tsx
+@@ -110,7 +110,7 @@ export function Deliverables({
+           phase={states[presentedFileUrl(sessionId, file.seq, file.index)]}
+           host={host === 'error' ? null : host} t={t}
+           onPreview={() => { openFile(file.path) }}
+-          contextMenuProps={getTriggerProps({ kind: 'file', value: { sessionId, path: file.path } })}
++          contextMenuProps={getTriggerProps({ kind: 'file', value: { sessionId, path: file.path, delivery: { seq: file.seq, index: file.index } } })}
+           actions={renderSlot('deliverables.file.actions', {
+             actionUrl: presentedFileUrl(sessionId, file.seq, file.index),
+             available: host !== null && host !== 'error' && host.available,
+diff --git a/packages/client/ui-deliverables/src/client/index.ts b/packages/client/ui-deliverables/src/client/index.ts
+index e07e6090ef..bf13a7ae9a 100644
+--- a/packages/client/ui-deliverables/src/client/index.ts
++++ b/packages/client/ui-deliverables/src/client/index.ts
+@@ -33,6 +33,20 @@ import {
+   deliverablesDefinition, presentedForClosing, producedFileMentions, selectProducedFiles,
+ } from './turn-deliverables.ts'
+ 
++declare module '@deepseek-ai/dsh-client-ui-context-menu/client' {
++  interface ContextMenuFileTarget {
++    /** The durable delivery event and original index, when this target is an explicit delivery card. */
++    readonly delivery?: { readonly seq: number; readonly index: number }
++  }
++}
++
++declare module '@deepseek-ai/cordis' {
++  interface Context {
++    /** Delivery cards expose their original event sequence and file index to menu contributions. */
++    deliveryCardCoordinates: { readonly version: 1 }
++  }
++}
++
+ export type { PresentedOpenOutcome, PresentedOpenFailure } from './present-open.ts'
+ 
+ declare module '@deepseek-ai/dsh-client-ui-slots' {
+@@ -114,5 +128,6 @@ export function apply(ctx: ClientContext): void {
+         getFileTriggerProps)
+     },
+   }
++  ctx.provide('deliveryCardCoordinates', { version: 1 })
+   ctx.provide('chatFileMentions', mentions)
+ }
+diff --git a/packages/client/ui-deliverables/src/client/turn-deliverables.ts b/packages/client/ui-deliverables/src/client/turn-deliverables.ts
+index d51b54edc4..4689b8e430 100644
+--- a/packages/client/ui-deliverables/src/client/turn-deliverables.ts
++++ b/packages/client/ui-deliverables/src/client/turn-deliverables.ts
+@@ -253,15 +253,13 @@ export function changesForClosing(owner: TurnTailOwnerProps): ChangesTurnData |
+ }
+ 
+ /**
+- * Select the latest declaration of each path in the closing turn, including
+- * declarations recorded after the closing reply.
++ * Select every delivery occurrence in the closing turn, including declarations
++ * recorded after the closing reply.
+  * @param owner - closing turn.
+- * @returns replayable deliveries in first-seen path order.
++ * @returns replayable deliveries in event and file order.
+  */
+ export function presentedForClosing(owner: TurnTailOwnerProps): PresentedPath[] {
+-  const files = new Map<string, PresentedPath>()
+-  for (const file of owner.turn.data.get('deliverables')?.presented ?? []) files.set(file.path, file)
+-  return [...files.values()]
++  return [...owner.turn.data.get('deliverables')?.presented ?? []]
+ }
+ 
+ export { basename } from '../presented.ts'
+diff --git a/packages/client/ui-deliverables/tests/deliverables.client.spec.tsx b/packages/client/ui-deliverables/tests/deliverables.client.spec.tsx
+index 9f8ed1d7b1..e8c7fcde20 100644
+--- a/packages/client/ui-deliverables/tests/deliverables.client.spec.tsx
++++ b/packages/client/ui-deliverables/tests/deliverables.client.spec.tsx
+@@ -874,6 +874,7 @@ describe('plugin registration', () => {
+ 
+     const fiber = ctx.plugin({ inject: [...inject], apply })
+     await fiber.await()
++    expect(ctx.get('deliveryCardCoordinates')).toEqual({ version: 1 })
+     const [entry] = ctx.slots.entries('conversation.chat.turnTail')
+     expect(entry).toBeDefined()
+     expect(ctx.slots.entries('tool.call.toolview')).toHaveLength(1)
+@@ -910,7 +911,10 @@ describe('plugin registration', () => {
+     vi.stubGlobal('fetch', fetcher)
+     const preview = vi.fn<(path: string) => void>()
+     for (const produced of [[], [{ path: 'out/report.docx' }]]) {
+-      const delivered = tailOwner({ produced, presented: [{ path: 'out/report.docx', seq: 2, index: 0 }] }, 3, preview)
++      const delivered = tailOwner({ produced, presented: [
++        { path: 'out/report.docx', seq: 2, index: 0 },
++        { path: 'out/report.docx', seq: 3, index: 1 },
++      ] }, 4, preview)
+       const { getTriggerProps } = contextMenuHook((target, point) => { ctx.contextMenus.open(target, point) })()
+       const mentions = service?.forClosing(delivered, SessionId('child-session'), path =>
+         getTriggerProps({ kind: 'file', value: { sessionId: SessionId('child-session'), path } }))
+@@ -981,6 +985,7 @@ describe('plugin registration', () => {
+     expect(registered).toBeUndefined()
+     // Fiber teardown retracts the service: the consumer's ctx.get sees the off state.
+     expect((ctx as { get(name: string): unknown }).get('chatFileMentions')).toBeUndefined()
++    expect(ctx.get('deliveryCardCoordinates')).toBeUndefined()
+   })
+ })
+ 
+@@ -997,12 +1002,47 @@ describe('presented files', () => {
+       at(5, 'turn/start', { turn: 2 }),
+     ])
+     expect(presentedForClosing(tailOwner(deliverablesOf(value), 4))).toMatchObject([
+-      { path: 'report.docx', seq: 3, index: 0, description: 'Updated report' },
++      { path: 'report.docx', seq: 2, index: 1, description: 'Final report' },
+       { path: 'notes.md', seq: 2, index: 2 },
++      { path: 'report.docx', seq: 3, index: 0, description: 'Updated report' },
+     ])
+     expect(selectDeliverables(tailOwner(deliverablesOf(value, 2), 9))).toBeNull()
+   })
+ 
++  it.each([
++    {
++      name: 'different events in one turn',
++      events: [
++        at(1, 'turn/start', { turn: 1 }),
++        at(2, 'deliverables/presented', { turn: 1, callId: 'first', files: [file()] }),
++        at(3, 'deliverables/presented', { turn: 1, callId: 'second', files: [file()] }),
++        at(4, 'turn/end', { turn: 1 }),
++      ],
++      expected: [{ seq: 2, index: 0 }, { seq: 3, index: 0 }],
++    },
++    {
++      name: 'different original indices in one event',
++      events: [
++        at(1, 'turn/start', { turn: 1 }),
++        at(2, 'deliverables/presented', { turn: 1, callId: 'one', files: [file(), null, file()] }),
++        at(3, 'turn/end', { turn: 1 }),
++      ],
++      expected: [{ seq: 2, index: 0 }, { seq: 2, index: 2 }],
++    },
++  ])('keeps same-path delivery cards for $name after a rerender', ({ events, expected }) => {
++    const owner = tailOwner(deliverablesOf(assembler(events)), 4)
++    const props = openProps()
++    const shared = { ...props, openFile: owner.openFile, sessionId: SessionId('viewed-session'), t: makeTranslate(en) }
++    const matched = selectDeliverables(owner)!
++    expect(matched.presented.map(({ seq, index }) => ({ seq, index }))).toEqual(expected)
++    const view = render(<Deliverables {...shared} matched={matched} />)
++    for (const button of view.getAllByRole('button', { name: 'Preview report.docx in sidebar' })) fireEvent.contextMenu(button)
++    view.rerender(<Deliverables {...shared} matched={selectDeliverables(owner)!} />)
++    for (const button of view.getAllByRole('button', { name: 'Preview report.docx in sidebar' })) fireEvent.contextMenu(button)
++    expect(props.openMenu.mock.calls.map(([target]) => target.kind === 'file' ? target.value.delivery : null))
++      .toEqual([...expected, ...expected])
++  })
++
+   it('keeps deliveries recorded after the closing reply', () => {
+     const value = assembler([
+       at(1, 'turn/start', { turn: 1 }),
+@@ -1014,6 +1054,40 @@ describe('presented files', () => {
+       .toMatchObject([{ path: 'report.docx', seq: 3, index: 0, description: 'Final report' }])
+   })
+ 
++  it('passes each delivered card\'s event and original index to its file menu', () => {
++    const props = openProps()
++    const view = render(<Deliverables {...props} matched={{ changes: null, presented: [
++      { path: 'north/report.txt', seq: 3, index: 1 },
++      { path: 'south/report.txt', seq: 8, index: 0 },
++    ] }} openFile={() => {}} sessionId={SessionId('viewed-session')} t={makeTranslate(en)} />)
++    fireEvent.contextMenu(view.getByRole('button', { name: 'Preview north/report.txt in sidebar' }))
++    fireEvent.contextMenu(view.getByRole('button', { name: 'Preview south/report.txt in sidebar' }))
++    expect(props.openMenu.mock.calls.map(([target]) => target)).toEqual([
++      { kind: 'file', value: { sessionId: 'viewed-session', path: 'north/report.txt', delivery: { seq: 3, index: 1 } } },
++      { kind: 'file', value: { sessionId: 'viewed-session', path: 'south/report.txt', delivery: { seq: 8, index: 0 } } },
++    ])
++  })
++
++  it('keeps the same delivered path distinct across turns', () => {
++    const value = assembler([
++      at(1, 'turn/start', { turn: 1 }),
++      at(2, 'deliverables/presented', { turn: 1, callId: 'one', files: [{ path: 'report.txt' }] }),
++      at(3, 'turn/end', { turn: 1 }),
++      at(4, 'turn/start', { turn: 2 }),
++      at(5, 'deliverables/presented', { turn: 2, callId: 'two', files: [{ path: 'report.txt' }] }),
++    ])
++    const props = openProps()
++    const shared = { ...props, openFile: () => {}, sessionId: SessionId('owner'), t: makeTranslate(en) }
++    const view = render(<>
++      <Deliverables {...shared} matched={selectDeliverables(tailOwner(deliverablesOf(value, 1), 3))!} />
++      <Deliverables {...shared} matched={selectDeliverables(tailOwner(deliverablesOf(value, 2), 6))!} />
++    </>)
++    for (const button of view.getAllByRole('button', { name: 'Preview report.txt in sidebar' })) fireEvent.contextMenu(button)
++    expect(props.openMenu.mock.calls.map(([target]) => target.kind === 'file' ? target.value.delivery : null)).toEqual([
++      { seq: 2, index: 0 }, { seq: 5, index: 0 },
++    ])
++  })
++
+   it('uses the viewed fork Session in every open action and expands all delivered files', () => {
+     const value = assembler([
+       at(1, 'turn/start', { turn: 1 }),
+@@ -1026,7 +1100,7 @@ describe('presented files', () => {
+     props.openPresented.mockResolvedValue({ kind: 'opened' })
+     const view = render(<Deliverables {...props} matched={matched} openFile={owner.openFile} sessionId={SessionId('child-session')} t={makeTranslate(en)} />)
+     fireEvent.contextMenu(view.getByRole('button', { name: 'Preview report-0.docx in sidebar' }), { clientX: 18, clientY: 29 })
+-    expect(props.openMenu).toHaveBeenCalledWith({ kind: 'file', value: { sessionId: 'child-session', path: 'report-0.docx' } }, { x: 18, y: 29 })
++    expect(props.openMenu).toHaveBeenCalledWith({ kind: 'file', value: { sessionId: 'child-session', path: 'report-0.docx', delivery: { seq: 2, index: 0 } } }, { x: 18, y: 29 })
+     expect(view.container.querySelectorAll('[data-presented-file]')).toHaveLength(4)
+     const expand = view.getByRole('button', { name: 'Show all 8 delivered files' })
+     expect(expand.getAttribute('aria-expanded')).toBe('false')
+diff --git a/scripts/gen-cordis-catalog.ts b/scripts/gen-cordis-catalog.ts
+index 4237a960a4..21fa9406d9 100644
+--- a/scripts/gen-cordis-catalog.ts
++++ b/scripts/gen-cordis-catalog.ts
+@@ -181,6 +181,7 @@ export const SERVICE_PAGE: Record<string, string> = {
+  */
+ export const SERVICE_WALK_EXEMPTIONS: Record<string, string> = {
+   contextMenus: 'client-side interface-typed menu registry — packages/client/ui-context-menu/README.md owns the API',
++  deliveryCardCoordinates: 'client-side delivery card capability — packages/client/ui-deliverables/README.md owns the API',
+   fileActions: 'client-side interface-typed file actions — packages/client/ui-file-actions/README.md owns the API',
+   invocation: 'not a service: per-call accessor (RemoteInvocation | undefined) the Gateway derives for each Remote call — packages/api/gateway/README.md owns the contract',
+   webTerminals: 'client-side terminal view models — packages/api/terminal-controller/README.md owns the API',

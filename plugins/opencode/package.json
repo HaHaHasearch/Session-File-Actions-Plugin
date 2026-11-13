@@ -1,0 +1,28 @@
+{
+  "name": "opencode-session-file-actions",
+  "version": "0.0.1",
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    "./gui-experimental": "./dist/gui-experimental.cjs"
+  },
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "2.2.5",
+    "effect": "4.1.0",
+    "solid-js": "1.9.17"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.2.5",
+    "@session-file-actions/core": "workspace:*",
+    "@types/node": "24.12.2",
+    "effect": "4.1.0",
+    "solid-js": "1.9.17",
+    "vite": "7.3.7",
+    "vite-plugin-solid": "2.11.10"
+  }
+}
