@@ -18,7 +18,7 @@ jobs:
           package-manager-cache: false
       - uses: pnpm/action-setup@v6
         with:
-          dest: .local/tools/pnpm
+          dest: ${{ github.workspace }}/.local/tools/pnpm
       - run: pnpm setup
       - run: pnpm verify
       - name: Pack and check plugin contents
